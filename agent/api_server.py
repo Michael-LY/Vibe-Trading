@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -458,6 +458,12 @@ class LiveStatusResponse(BaseModel):
     brokers: List[LiveBrokerStatus]
 
 
+class ChannelPairingCommandRequest(BaseModel):
+    """Pairing command executed through the IM control surface."""
+
+    channel: str = Field(..., min_length=1, max_length=64)
+    command: str = Field("list", max_length=500)
+
 
 # ============================================================================
 # FastAPI Application
@@ -547,6 +553,14 @@ def _is_allowed_loopback_host(host: str) -> bool:
     return normalized in _DEFAULT_LOOPBACK_HOSTS or normalized in _EXTRA_LOOPBACK_HOSTS
 
 
+def _is_loopback_bind_host(host: str) -> bool:
+    """Return whether ``host`` resolves to a loopback interface."""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 # CORS: override with CORS_ORIGINS (comma-separated explicit origins)
 _CORS_ORIGINS = _parse_cors_origins(os.getenv("CORS_ORIGINS"))
 
@@ -632,11 +646,14 @@ async def _run_startup_preflight() -> None:
 
     run_preflight(console)
     _start_scheduled_research_executor()
+    if os.getenv("VIBE_TRADING_CHANNELS_AUTO_START", "").strip().lower() in {"1", "true", "yes"}:
+        await _start_channel_runtime()
 
 
 @app.on_event("shutdown")
 async def _stop_scheduled_research_on_shutdown() -> None:
     """Stop the scheduled research executor on server shutdown."""
+    await _stop_channel_runtime()
     await _stop_scheduled_research_executor()
 
 
@@ -1697,6 +1714,39 @@ async def health_check():
     )
 
 
+@app.get("/channels/status", dependencies=[Depends(require_auth)])
+async def channels_status():
+    """Return IM channel runtime and adapter status."""
+    runtime = _get_channel_runtime()
+    return runtime.status()
+
+
+@app.post("/channels/start", dependencies=[Depends(require_auth)])
+async def channels_start():
+    """Start configured IM channel adapters."""
+    runtime = await _start_channel_runtime()
+    return {"status": "started", **runtime.status()}
+
+
+@app.post("/channels/stop", dependencies=[Depends(require_auth)])
+async def channels_stop():
+    """Stop configured IM channel adapters."""
+    runtime = _get_channel_runtime()
+    await runtime.stop()
+    return {"status": "stopped", **runtime.status()}
+
+
+@app.post("/channels/pairing/command", dependencies=[Depends(require_auth)])
+async def channels_pairing_command(payload: ChannelPairingCommandRequest):
+    """Run a pairing command against the shared pairing store."""
+    from src.channels.pairing import handle_pairing_command
+
+    return {
+        "channel": payload.channel,
+        "reply": handle_pairing_command(payload.channel, payload.command),
+    }
+
+
 @app.get("/correlation")
 async def get_correlation_matrix(
     codes: str = Query(..., description="Comma-separated asset codes, e.g. BTC-USDT,ETH-USDT,SPY"),
@@ -1785,6 +1835,9 @@ async def api_info():
 
 _session_service = None
 _goal_store = None
+_channel_runtime = None
+_channel_bus = None
+_channel_manager = None
 
 
 def _get_session_service():
@@ -1816,6 +1869,46 @@ def _get_session_service():
         runs_dir=RUNS_DIR,
     )
     return _session_service
+
+
+def _get_channel_runtime():
+    """Lazy-init IM channel runtime without starting platform adapters."""
+    global _channel_runtime, _channel_bus, _channel_manager
+    if _channel_runtime is not None:
+        return _channel_runtime
+
+    from src.channels.bus.queue import MessageBus
+    from src.channels.config import load_channels_config
+    from src.channels.manager import ChannelManager
+    from src.channels.runtime import ChannelRuntime
+
+    svc = _get_session_service()
+    if not svc:
+        raise HTTPException(status_code=501, detail="Session runtime not enabled")
+
+    _channel_bus = MessageBus()
+    config = load_channels_config()
+    _channel_manager = ChannelManager(config, _channel_bus, session_service=svc)
+    _channel_runtime = ChannelRuntime(
+        bus=_channel_bus,
+        session_service=svc,
+        manager=_channel_manager,
+    )
+    return _channel_runtime
+
+
+async def _start_channel_runtime():
+    """Start the IM channel runtime."""
+    runtime = _get_channel_runtime()
+    await runtime.start(start_manager=True)
+    return runtime
+
+
+async def _stop_channel_runtime() -> None:
+    """Stop the IM channel runtime if it was initialized."""
+    if _channel_runtime is None:
+        return
+    await _channel_runtime.stop()
 
 
 def _get_goal_store():
@@ -2237,110 +2330,21 @@ async def session_events(
 
 
 # ============================================================================
-# File Upload
+# Upload routes - defined in src/api/uploads_routes.py
 # ============================================================================
 
-_BLOCKED_UPLOAD_EXT = {
-    # binaries / executables we should never accept
-    ".exe", ".msi", ".bat", ".cmd", ".com", ".scr", ".app", ".dmg",
-    ".so", ".dll", ".dylib",
-    # executable-adjacent source, shell, config, and template files
-    ".py", ".pyw", ".sh", ".bash", ".zsh", ".fish", ".ps1",
-    ".yaml", ".yml", ".j2", ".jinja", ".jinja2", ".template",
-    # archives — don't auto-extract; user can unpack locally
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz",
-}
+from src.api.uploads_routes import register_uploads_routes  # noqa: E402
+register_uploads_routes(app)
 
-_BLOCKED_UPLOAD_NAMES = {
-    "dockerfile",
-    "containerfile",
-}
-
-
-_SHADOW_ID_RE = __import__("re").compile(r"^shadow_[0-9a-f]{8}$")
-
-
-@app.get("/shadow-reports/{shadow_id}", dependencies=[Depends(require_auth)])
-async def get_shadow_report(shadow_id: str, format: str = "html"):
-    """Serve a rendered Shadow Account report (HTML by default, PDF if available).
-
-    Reports live under ``~/.vibe-trading/shadow_reports/<shadow_id>.{html,pdf}``.
-    """
-    if not _SHADOW_ID_RE.match(shadow_id):
-        raise HTTPException(status_code=400, detail="invalid shadow_id")
-    if format not in ("html", "pdf"):
-        raise HTTPException(status_code=400, detail="format must be html or pdf")
-
-    reports_dir = Path.home() / ".vibe-trading" / "shadow_reports"
-    path = reports_dir / f"{shadow_id}.{format}"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"Shadow report not found: {shadow_id}.{format}")
-
-    media_type = "text/html; charset=utf-8" if format == "html" else "application/pdf"
-    # Inline so browsers render HTML/PDF directly instead of forcing download.
-    return FileResponse(
-        path,
-        media_type=media_type,
-        headers={"Content-Disposition": f'inline; filename="{shadow_id}.{format}"'},
-    )
-
-
-@app.post("/upload", dependencies=[Depends(require_auth)])
-async def upload_file(file: UploadFile):
-    """Upload any document or data file (max 50MB).
-
-    Accepts most common formats: PDF, Word, Excel, PowerPoint, images,
-    CSV/TSV, plain text, JSON, and TOML. Executables, executable-adjacent
-    source/config/template files, and archives are rejected.
-    """
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing filename")
-    filename = Path(file.filename).name
-    ext = Path(filename).suffix.lower()
-    if ext in _BLOCKED_UPLOAD_EXT or filename.lower() in _BLOCKED_UPLOAD_NAMES:
-        raise HTTPException(
-            status_code=400,
-            detail="This file type is not allowed for upload.",
-        )
-
-    safe_name = f"{uuid.uuid4().hex}{ext}"
-    dest = UPLOADS_DIR / safe_name
-    total_size = 0
-
-    try:
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        with dest.open("wb") as handle:
-            while True:
-                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
-                total_size += len(chunk)
-                if total_size > MAX_UPLOAD_SIZE:
-                    handle.close()
-                    if dest.exists():
-                        dest.unlink()
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File too large (limit {MAX_UPLOAD_SIZE // (1024 * 1024)} MB)",
-                    )
-                handle.write(chunk)
-    except HTTPException:
-        raise
-    except OSError as exc:
-        if dest.exists():
-            dest.unlink()
-        raise HTTPException(
-            status_code=500,
-            detail="Upload failed while storing the file. Please retry or choose a different file.",
-        ) from exc
-    finally:
-        await file.close()
-
-    return {
-        "status": "ok",
-        "file_path": f"uploads/{safe_name}",
-        "filename": filename,
-    }
+# Re-export upload constants for test access via ``api_server.*``.
+from src.api.uploads_routes import (  # noqa: E402
+    MAX_UPLOAD_SIZE,
+    UPLOADS_DIR,
+    _BLOCKED_UPLOAD_EXT,
+    _BLOCKED_UPLOAD_NAMES,
+    _SHADOW_ID_RE,
+    _UPLOAD_CHUNK_SIZE,
+)
 
 
 # ============================================================================
@@ -3493,12 +3497,19 @@ def serve_main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="Vibe-Trading Server")
     parser.add_argument("--port", type=int, default=8000, help="Listen port (default 8000)")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--dev", action="store_true", help="Dev mode: spawn Vite on :5173")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
+
+    if not _is_loopback_bind_host(args.host) and not _configured_api_key():
+        print(
+            f"[warn] Binding to {args.host} without API_AUTH_KEY set. "
+            f"Remote requests are rejected by the loopback peer-IP check, "
+            f"but consider using --host 127.0.0.1 for local-only access."
+        )
 
     frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     frontend_root = Path(__file__).resolve().parent.parent / "frontend"
